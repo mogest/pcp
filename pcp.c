@@ -14,8 +14,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <assert.h>
-#include <sys/types.h>
-#include <sys/mman.h>
 
 #define DEFAULT_NUMBER_OF_THREADS 4
 #define MAX_THREADS 255
@@ -143,27 +141,39 @@ ssh_channel set_up_ssh_channel(struct instruction *instruction) {
 }
 
 int transfer_data(struct instruction *instruction, ssh_channel channel) {
-    int page_size = sysconf(_SC_PAGESIZE);
-    off_t page_size_offset = instruction->offset % page_size;
-    off_t page_size_aligned_offset = instruction->offset - page_size_offset;
-    size_t map_size = instruction->size + page_size_offset;
-
-    char *map = (char *)mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, instruction->fd, page_size_aligned_offset);
-    if (map == MAP_FAILED) {
-        perror("mmap");
+    if (lseek(instruction->fd, instruction->offset, SEEK_SET) == -1) {
+        perror("lseek");
         return -1;
     }
 
-    ssize_t written = ssh_channel_write(channel, map + page_size_offset, instruction->size);
-    if (written != instruction->size) {
-        fprintf(stderr, "ssh channel didn't accept all bytes, size = %ld, written = %ld\n", instruction->size, written);
-        munmap(map, instruction->size);
-        return -1;
+    char *buffer = (char *)malloc(BLOCK_SIZE);
+    if (buffer == NULL) abort();
+
+    size_t expected, size = instruction->size;
+    ssize_t n, written;
+
+    while (size > 0) {
+        expected = size < BLOCK_SIZE ? size : BLOCK_SIZE;
+
+        n = read(instruction->fd, buffer, expected);
+        if (n != expected) {
+            perror("read");
+            free(buffer);
+            return -1;
+        }
+
+        written = ssh_channel_write(channel, buffer, n);
+        if (written != n) {
+            fprintf(stderr, "ssh channel didn't accept all bytes, %ld left to go\n", size - written);
+            free(buffer);
+            return -1;
+        }
+
+        size -= n;
     }
 
+    free(buffer);
     ssh_channel_send_eof(channel);
-
-    munmap(map, map_size);
 
     return 0;
 }
