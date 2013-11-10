@@ -141,6 +141,44 @@ ssh_channel set_up_ssh_channel(struct instruction *instruction) {
 }
 
 int transfer_data(struct instruction *instruction, ssh_channel channel) {
+    if (lseek(instruction->fd, instruction->offset, SEEK_SET) == -1) {
+        perror("lseek");
+        return -1;
+    }
+
+    char *buffer = (char *)malloc(BLOCK_SIZE);
+    if (buffer == NULL) abort();
+
+    size_t expected, size = instruction->size;
+    ssize_t n, written;
+
+    while (size > 0) {
+        expected = size < BLOCK_SIZE ? size : BLOCK_SIZE;
+
+        n = read(instruction->fd, buffer, expected);
+        if (n != expected) {
+            perror("read");
+            free(buffer);
+            return -1;
+        }
+
+        written = ssh_channel_write(channel, buffer, n);
+        if (written != n) {
+            fprintf(stderr, "ssh channel didn't accept all bytes, %ld left to go\n", size - written);
+            free(buffer);
+            return -1;
+        }
+
+        size -= n;
+    }
+
+    free(buffer);
+    ssh_channel_send_eof(channel);
+
+    return 0;
+}
+
+int send_command(struct instruction *instruction, ssh_channel channel) {
     size_t command_length = strlen(config.output_filename);
 
     if (command_length > 65535) {
@@ -165,35 +203,6 @@ int transfer_data(struct instruction *instruction, ssh_channel channel) {
     }
 
     free(command);
-
-    if (lseek(instruction->fd, instruction->offset, SEEK_SET) == -1) {
-        perror("lseek");
-        return -1;
-    }
-
-    char *buffer = (char *)malloc(BLOCK_SIZE);
-    if (buffer == NULL) abort();
-
-    size_t size = instruction->size;
-    while (size > 0) {
-        ssize_t n = read(instruction->fd, buffer, size < BLOCK_SIZE ? size : BLOCK_SIZE);
-        if (n <= 0) {
-            perror("read");
-            free(buffer);
-            return -1;
-        }
-        ssize_t written = ssh_channel_write(channel, buffer, n);
-        if (written != n) {
-            fprintf(stderr, "ssh channel didn't accept all bytes, %ld left to go\n", size - written);
-            free(buffer);
-            return -1;
-        }
-        size -= n;
-    }
-
-    free(buffer);
-    ssh_channel_send_eof(channel);
-
     return 0;
 }
 
@@ -208,7 +217,10 @@ void *send_to_remote(void *v_instruction) {
             result = -1;
         }
         else {
-            result = transfer_data(instruction, channel);
+            result = send_command(instruction, channel);
+            if (result == 0) {
+                result = transfer_data(instruction, channel);
+            }
 
             ssh_channel_close(channel);
             ssh_channel_free(channel);
