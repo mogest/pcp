@@ -1,11 +1,11 @@
-/* 
+/*
  * TODO:
  *  - make an ssh connection that O_TRUNCs the file, then continue with the rest of the threads
  *  - configurable location of remote pcp binary
  *  - more gracefully handle not being in known_hosts
  */
 
-#include <libssh/libssh.h> 
+#include <libssh/libssh.h>
 #include <libssh/callbacks.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -19,6 +19,7 @@
 #define MAX_THREADS 255
 #define MIN_THREADED_COPY_SIZE 1024 // must be greater than MAX_THREADS
 #define BLOCK_SIZE 1048576
+#define RING_BUFFER_SIZE (BLOCK_SIZE * 2) // must be a multiple of BLOCK_SIZE
 #define REMOTE_COMMAND_TO_EXECUTE "~/source/pcp/pcp"
 
 struct {
@@ -37,6 +38,18 @@ struct instruction {
     int fd;
     off_t offset;
     size_t size;
+};
+
+struct io {
+    int fd;
+    char *buffer;
+    size_t size;
+    pthread_t parent_thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cv;
+    int read_position;
+    int fill_count;
+    int aborted;
 };
 
 int load_config(int argc, char *argv[]) {
@@ -140,6 +153,44 @@ ssh_channel set_up_ssh_channel(struct instruction *instruction) {
     return channel;
 }
 
+void *read_from_fd(void *v_io) {
+    struct io *io = (struct io *)v_io;
+
+    size_t size = io->size;
+    ssize_t expected;
+    int write_position;
+
+    pthread_mutex_lock(&io->mutex);
+
+    while (size > 0) {
+        while (io->fill_count == RING_BUFFER_SIZE) {
+            pthread_cond_wait(&io->cv, &io->mutex);
+        }
+        write_position = (io->read_position + io->fill_count) % RING_BUFFER_SIZE;
+        expected = size < BLOCK_SIZE ? size : BLOCK_SIZE;
+        assert(write_position + expected <= RING_BUFFER_SIZE);
+        pthread_mutex_unlock(&io->mutex);
+
+        ssize_t n = read(io->fd, io->buffer + write_position, expected);
+        if (n != expected) {
+            perror("read");
+            io->aborted = 1;
+            pthread_mutex_lock(&io->mutex);
+            pthread_cond_signal(&io->cv);
+            pthread_mutex_unlock(&io->mutex);
+            return NULL;
+        }
+        size -= n;
+
+        pthread_mutex_lock(&io->mutex);
+        io->fill_count += n;
+        pthread_cond_signal(&io->cv);
+    }
+
+    pthread_mutex_unlock(&io->mutex);
+    return NULL;
+}
+
 int transfer_data(struct instruction *instruction, ssh_channel channel) {
     size_t command_length = strlen(config.output_filename);
 
@@ -171,30 +222,61 @@ int transfer_data(struct instruction *instruction, ssh_channel channel) {
         return -1;
     }
 
-    char *buffer = (char *)malloc(BLOCK_SIZE);
-    if (buffer == NULL) abort();
+    struct io io;
 
-    size_t size = instruction->size;
-    while (size > 0) {
-        ssize_t n = read(instruction->fd, buffer, size < BLOCK_SIZE ? size : BLOCK_SIZE);
-        if (n <= 0) {
-            perror("read");
-            free(buffer);
-            return -1;
-        }
-        ssize_t written = ssh_channel_write(channel, buffer, n);
-        if (written != n) {
-            fprintf(stderr, "ssh channel didn't accept all bytes, %ld left to go\n", size - written);
-            free(buffer);
-            return -1;
-        }
-        size -= n;
+    io.aborted = 0;
+    io.parent_thread = pthread_self();
+    io.fd = instruction->fd;
+    io.size = instruction->size;
+    io.buffer = (char *)malloc(RING_BUFFER_SIZE);
+    if (io.buffer == NULL) abort();
+    io.read_position = io.fill_count = 0;
+
+    pthread_t reader;
+    if (pthread_create(&reader, NULL, read_from_fd, (void *)&io) == -1) {
+        fprintf(stderr, "Couldn't start reader thread\n");
+        return -1;
     }
 
-    free(buffer);
-    ssh_channel_send_eof(channel);
+    size_t size = instruction->size;
 
-    return 0;
+    pthread_mutex_lock(&io.mutex);
+
+    while (size > 0) {
+        while (io.fill_count == 0 && !io.aborted) {
+            pthread_cond_wait(&io.cv, &io.mutex);
+        }
+        if (io.aborted) break;
+
+        ssize_t n = io.fill_count;
+        pthread_mutex_unlock(&io.mutex);
+
+        assert(n <= size);
+        if (io.read_position + n > RING_BUFFER_SIZE) n = RING_BUFFER_SIZE - io.read_position;
+
+        ssize_t written = ssh_channel_write(channel, io.buffer + io.read_position, n);
+        if (written != n) {
+            fprintf(stderr, "%ld, %ld, %ld, ssh channel didn't accept all bytes, %ld left to go\n", n, size, written, size - written);
+            break;
+        }
+        size -= n;
+
+        pthread_mutex_lock(&io.mutex);
+        io.fill_count -= n;
+        io.read_position += n;
+        if (io.read_position >= BLOCK_SIZE * 2) io.read_position -= RING_BUFFER_SIZE;
+        pthread_cond_signal(&io.cv);
+    }
+
+    pthread_mutex_unlock(&io.mutex);
+    pthread_join(reader, NULL);
+
+    free(io.buffer);
+    if (size == 0) {
+        ssh_channel_send_eof(channel);
+    }
+
+    return size == 0 ? 0 : -1;
 }
 
 void *send_to_remote(void *v_instruction) {
