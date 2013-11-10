@@ -315,18 +315,43 @@ int server_mode(void) {
     char *buffer = (char *)malloc(BLOCK_SIZE);
     if (buffer == NULL) abort();
 
+    size_t read_position = 0, read_size = BLOCK_SIZE;
     ssize_t n;
+    int retval = 0;
+
     while (size > 0) {
-        n = read(0, buffer, size < BLOCK_SIZE ? size : BLOCK_SIZE);
-        if (n <= 0) abort(); // TODO
-        if (write(fd, buffer, n) != n) abort(); // TODO
+        n = read(0, buffer + read_position, size < read_size ? size : read_size);
+        if (n == 0) {
+            fprintf(stderr, "got EOF before we received all the data\n");
+            retval = 1;
+            break;
+        }
+        if (n == -1) {
+            perror("read");
+            retval = 1;
+            break;
+        }
+
         size -= n;
+        read_position += n;
+        read_size -= n;
+
+        if (size == 0 || read_size < 65536) { // TODO : 65536 = pipe buffer size
+            n = write(fd, buffer, read_position);
+            if (n != read_position) {
+                perror("write");
+                retval = 1;
+                break;
+            }
+            read_position = 0;
+            read_size = BLOCK_SIZE;
+        }
     }
 
     free(buffer);
 
     close(fd);
-    return 0;
+    return retval;
 }
 
 int main(int argc, char *argv[]) {
